@@ -429,6 +429,3 @@ public class PlaggController {
         return ResponseEntity.ok().header("Content-Type", "text/html; charset=UTF-8").body(html);
     }
 }
-git add .
-git commit -m "Add live leaderboard + AI insight"
-git push
