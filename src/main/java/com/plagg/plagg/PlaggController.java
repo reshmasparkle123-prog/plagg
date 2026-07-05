@@ -1,10 +1,26 @@
 package com.plagg.plagg;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
 
+import com.google.zxing.BarcodeFormat;
+import com.google.zxing.WriterException;
+import com.google.zxing.client.j2se.MatrixToImageWriter;
+import com.google.zxing.common.BitMatrix;
+import com.google.zxing.qrcode.QRCodeWriter;
+
+import java.io.ByteArrayOutputStream;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.regex.Matcher;
@@ -54,6 +70,18 @@ public class PlaggController {
         }
     }
 
+    static class ResumeAnalysis {
+        int score;
+        List<String> strengths;
+        List<String> improvements;
+
+        ResumeAnalysis(int score, List<String> strengths, List<String> improvements) {
+            this.score = score;
+            this.strengths = strengths;
+            this.improvements = improvements;
+        }
+    }
+
     static final String[] RESUME_KEYWORDS = {
         "java", "python", "javascript", "typescript", "react", "node", "sql", "aws",
         "docker", "kubernetes", "machine learning", "spring", "git", "api", "cloud",
@@ -61,31 +89,218 @@ public class PlaggController {
         "hackathon", "open source", "data structures", "algorithms"
     };
 
-    static int computeResumeScore(String resume) {
-        if (resume == null || resume.isBlank()) return 4;
+    static final String[] ACTION_VERBS = {
+        "built", "led", "developed", "designed", "improved", "created", "implemented",
+        "managed", "optimized", "launched", "architected", "deployed", "automated",
+        "increased", "reduced", "collaborated", "mentored"
+    };
+
+    static final String MASCOT_SVG = """
+        <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+            <ellipse cx="50" cy="58" rx="34" ry="30" fill="#1a1a1a"/>
+            <path d="M 20 40 L 12 14 L 38 32 Z" fill="#1a1a1a"/>
+            <path d="M 80 40 L 88 14 L 62 32 Z" fill="#1a1a1a"/>
+            <path d="M 22 38 L 18 22 L 34 33 Z" fill="#00ff88" opacity="0.55"/>
+            <path d="M 78 38 L 82 22 L 66 33 Z" fill="#00ff88" opacity="0.55"/>
+            <ellipse cx="36" cy="55" rx="7" ry="9" fill="#00ff88"/>
+            <ellipse cx="64" cy="55" rx="7" ry="9" fill="#00ff88"/>
+            <ellipse cx="36" cy="58" rx="2.6" ry="4.2" fill="#031"/>
+            <ellipse cx="64" cy="58" rx="2.6" ry="4.2" fill="#031"/>
+            <path d="M 46 68 Q 50 72 54 68" stroke="#00ff88" stroke-width="2" fill="none" stroke-linecap="round"/>
+            <path d="M 50 64 L 46 68 M 50 64 L 54 68" stroke="#00ff88" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+            <line x1="8" y1="60" x2="26" y2="58" stroke="#333" stroke-width="1.5" stroke-linecap="round"/>
+            <line x1="8" y1="68" x2="26" y2="66" stroke="#333" stroke-width="1.5" stroke-linecap="round"/>
+            <line x1="92" y1="60" x2="74" y2="58" stroke="#333" stroke-width="1.5" stroke-linecap="round"/>
+            <line x1="92" y1="68" x2="74" y2="66" stroke="#333" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+        """;
+
+    static final String MASCOT_CSS = """
+        .mascot-row { display: flex; align-items: flex-end; gap: 10px; max-width: 420px; margin: 0 auto 14px; }
+        .mascot-icon { width: 46px; height: 46px; flex-shrink: 0; background: #141414; border: 1px solid #222; border-radius: 50%; padding: 6px; cursor: pointer; transition: transform 0.15s, border-color 0.15s; }
+        .mascot-icon:hover { transform: scale(1.08); border-color: #00ff88; }
+        .mascot-icon.speaking { animation: mascotBounce 0.5s ease-in-out infinite; border-color: #00ff88; }
+        @keyframes mascotBounce { 0%, 100% { transform: translateY(0) scale(1.05); } 50% { transform: translateY(-6px) scale(1.12); } }
+        .mascot-icon svg { width: 100%; height: 100%; display: block; pointer-events: none; }
+        .mascot-bubble { background: #141414; border: 1px solid #222; border-radius: 14px 14px 14px 2px; padding: 10px 14px; font-size: 0.82em; color: #ccc; line-height: 1.4; position: relative; }
+        .mascot-bubble strong { color: #00ff88; }
+        .mascot-hint { font-size: 0.62em; color: #444; margin-top: 3px; }
+        """;
+
+    static final String MASCOT_JS = """
+        <script>
+        function plaggSpeak(el) {
+            try {
+                var msg = el.getAttribute('data-message');
+                if (!msg || !('speechSynthesis' in window)) return;
+                window.speechSynthesis.cancel();
+                var utter = new SpeechSynthesisUtterance(msg);
+                utter.rate = 1.0;
+                utter.pitch = 1.15;
+                el.classList.add('speaking');
+                utter.onend = function() { el.classList.remove('speaking'); };
+                utter.onerror = function() { el.classList.remove('speaking'); };
+                window.speechSynthesis.speak(utter);
+            } catch (e) {}
+        }
+        </script>
+        """;
+
+    static String escapeForAttr(String s) {
+        return s.replace("&", "&amp;").replace("\"", "&quot;");
+    }
+
+    static String mascotBlock(String message) {
+        String safeAttr = escapeForAttr(message);
+        return """
+            <div class="mascot-row">
+                <div class="mascot-icon" onclick="plaggSpeak(this)" data-message="%s" title="Click to hear Plagg!">%s</div>
+                <div>
+                    <div class="mascot-bubble"><strong>Plagg:</strong> %s</div>
+                    <div class="mascot-hint">&#128266; tap Plagg to hear this</div>
+                </div>
+            </div>
+            """.formatted(safeAttr, MASCOT_SVG, message);
+    }
+
+    static String mascotMessageForScore(int total) {
+        if (total >= 70) return "Whoa, you're crushing it! Fast-tracking you to the top.";
+        if (total >= 50) return "Solid profile! You're in good shape for an interview.";
+        if (total >= 30) return "Getting there! A bit more polish and you'll qualify easily.";
+        return "Early days, but everyone starts somewhere. Keep building!";
+    }
+
+    // Fallback: keyword-based heuristic, used if Groq API key missing or call fails
+    static ResumeAnalysis analyzeResumeFallback(String resume) {
+        List<String> strengths = new ArrayList<>();
+        List<String> improvements = new ArrayList<>();
+
+        if (resume == null || resume.isBlank()) {
+            improvements.add("No resume was submitted - add one next time so PLAGG can properly screen your background and boost your Resume Screening + AI Composite scores.");
+            return new ResumeAnalysis(4, strengths, improvements);
+        }
+
         String text = resume.toLowerCase();
         int score = 5;
+
+        if (resume.trim().length() < 50) {
+            improvements.add("Resume text is very short - paste a fuller version for a more accurate screening.");
+        }
+
         int matches = 0;
         for (String k : RESUME_KEYWORDS) {
             if (text.contains(k)) matches++;
         }
         score += Math.min(matches, 10);
-        if (text.matches("(?s).*\\d+%.*") || text.matches("(?s).*\\b\\d{2,}\\+.*")) score += 3;
-        if (resume.trim().length() > 150) score += 2;
-        return Math.min(score, 20);
+        if (matches >= 5) {
+            strengths.add("Strong technical keyword coverage (" + matches + " relevant skills detected).");
+        } else if (matches > 0) {
+            improvements.add("Only " + matches + " technical keyword(s) found - list more specific skills, languages, or tools.");
+        } else {
+            improvements.add("No recognizable technical keywords found - add specific skills, languages, or tools you've used.");
+        }
+
+        boolean hasQuantified = text.matches("(?s).*\\d+%.*") || text.matches("(?s).*\\b\\d{2,}\\+.*");
+        if (hasQuantified) {
+            score += 3;
+            strengths.add("Includes quantified achievements (numbers/percentages) - shows measurable impact.");
+        } else {
+            improvements.add("No quantified achievements found - add numbers, e.g. \"improved performance by 30%\" or \"led a team of 5\".");
+        }
+
+        boolean hasActionVerb = false;
+        for (String v : ACTION_VERBS) {
+            if (text.contains(v)) { hasActionVerb = true; break; }
+        }
+        if (hasActionVerb) {
+            strengths.add("Uses strong action verbs to describe experience.");
+        } else {
+            improvements.add("Start bullet points with action verbs like \"built\", \"led\", \"designed\", or \"improved\".");
+        }
+
+        if (resume.trim().length() > 150) {
+            score += 2;
+            strengths.add("Good level of detail in the resume text.");
+        }
+
+        score = Math.min(score, 20);
+        if (strengths.isEmpty()) strengths.add("Resume submitted and reviewed.");
+        if (improvements.isEmpty()) improvements.add("No major issues found - resume looks solid.");
+        return new ResumeAnalysis(score, strengths, improvements);
     }
 
-    static String resumeFeedback(String resume, int resumeScore) {
+    // Primary: real AI analysis via Groq. Falls back to keyword heuristic on any failure.
+    static ResumeAnalysis analyzeResumeWithAI(String resume) {
         if (resume == null || resume.isBlank()) {
-            return "No resume text provided - add one next time for a deeper AI screening score.";
+            List<String> improvements = new ArrayList<>();
+            improvements.add("No resume was submitted - add one next time so PLAGG's AI can properly screen your background.");
+            return new ResumeAnalysis(4, new ArrayList<>(), improvements);
         }
-        if (resumeScore >= 16) {
-            return "Strong resume: good technical keyword coverage and quantified achievements.";
+
+        String apiKey = System.getenv("GROQ_API_KEY");
+        if (apiKey == null || apiKey.isBlank()) {
+            return analyzeResumeFallback(resume);
         }
-        if (resumeScore >= 10) {
-            return "Decent resume, but could use more specific metrics or technical keywords.";
+
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+
+            String systemPrompt = "You are an expert technical recruiter AI screening candidate resumes for a hackathon recruiting tool. "
+                + "Respond with ONLY valid JSON, no markdown fences, no explanation, in exactly this format: "
+                + "{\"score\": <integer 0-20>, \"strengths\": [\"...\", \"...\"], \"improvements\": [\"...\", \"...\"]}. "
+                + "The score reflects overall resume quality out of 20 points. "
+                + "List 2-4 concise, specific strengths and 2-4 concise, specific improvements (real mistakes or missing elements) based only on the actual resume content provided.";
+
+            List<Map<String, String>> messages = new ArrayList<>();
+            Map<String, String> sysMsg = new LinkedHashMap<>();
+            sysMsg.put("role", "system");
+            sysMsg.put("content", systemPrompt);
+            Map<String, String> userMsg = new LinkedHashMap<>();
+            userMsg.put("role", "user");
+            userMsg.put("content", "Resume:\n" + resume);
+            messages.add(sysMsg);
+            messages.add(userMsg);
+
+            Map<String, Object> body = new LinkedHashMap<>();
+            body.put("model", "llama-3.3-70b-versatile");
+            body.put("messages", messages);
+            body.put("temperature", 0.3);
+            body.put("max_tokens", 500);
+
+            String jsonBody = mapper.writeValueAsString(body);
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            headers.setBearerAuth(apiKey);
+            HttpEntity<String> request = new HttpEntity<>(jsonBody, headers);
+
+            RestTemplate rt = new RestTemplate();
+            String response = rt.postForObject("https://api.groq.com/openai/v1/chat/completions", request, String.class);
+
+            JsonNode root = mapper.readTree(response);
+            String content = root.path("choices").get(0).path("message").path("content").asText();
+
+            content = content.trim();
+            if (content.startsWith("```")) {
+                content = content.replaceAll("^```json", "").replaceAll("^```", "").replaceAll("```$", "").trim();
+            }
+
+            JsonNode parsed = mapper.readTree(content);
+            int score = parsed.path("score").asInt(10);
+            score = Math.max(0, Math.min(score, 20));
+
+            List<String> strengths = new ArrayList<>();
+            for (JsonNode n : parsed.path("strengths")) strengths.add(n.asText());
+            List<String> improvements = new ArrayList<>();
+            for (JsonNode n : parsed.path("improvements")) improvements.add(n.asText());
+
+            if (strengths.isEmpty()) strengths.add("Resume reviewed by AI - looks reasonable overall.");
+            if (improvements.isEmpty()) improvements.add("No major issues found by AI screening.");
+
+            return new ResumeAnalysis(score, strengths, improvements);
+        } catch (Exception e) {
+            return analyzeResumeFallback(resume);
         }
-        return "Resume is thin on technical keywords and measurable achievements - consider expanding it.";
     }
 
     static String generateInsight(int githubScore, int leetcodeScore, int linkedinScore,
@@ -107,6 +322,38 @@ public class PlaggController {
         }
     }
 
+    static String getLocalIp() {
+        try {
+            Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface iface = interfaces.nextElement();
+                if (iface.isLoopback() || !iface.isUp()) continue;
+                Enumeration<InetAddress> addresses = iface.getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    InetAddress addr = addresses.nextElement();
+                    if (addr.isSiteLocalAddress() && addr.getHostAddress().indexOf(':') == -1) {
+                        return addr.getHostAddress();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // fall through
+        }
+        return "localhost";
+    }
+
+    static String generateQrBase64(String text) {
+        try {
+            QRCodeWriter writer = new QRCodeWriter();
+            BitMatrix matrix = writer.encode(text, BarcodeFormat.QR_CODE, 260, 260);
+            ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            MatrixToImageWriter.writeToStream(matrix, "PNG", baos);
+            return Base64.getEncoder().encodeToString(baos.toByteArray());
+        } catch (WriterException | java.io.IOException e) {
+            return "";
+        }
+    }
+
     static String errorPage(List<String> errors) {
         StringBuilder items = new StringBuilder();
         for (String e : errors) {
@@ -123,6 +370,7 @@ public class PlaggController {
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Inter', sans-serif; background: #0a0a0a; color: #fff; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; }
+        %s
         .err-card { background: #141414; border: 1px solid #3a1414; border-radius: 18px; padding: 28px; max-width: 420px; }
         h1 { font-family: 'Space Grotesk', sans-serif; font-size: 1.4em; color: #ef4444; margin-bottom: 14px; }
         ul { margin: 0 0 20px 20px; color: #ddd; font-size: 0.92em; line-height: 1.8; }
@@ -130,14 +378,16 @@ public class PlaggController {
     </style>
 </head>
 <body>
+    %s
     <div class="err-card">
         <h1>&#9888; Please fix the following</h1>
         <ul>%s</ul>
         <a class="back" href="/">&#8592; Back to form</a>
     </div>
+    %s
 </body>
 </html>
-        """.formatted(items.toString());
+        """.formatted(MASCOT_CSS, mascotBlock("Oops! Let's fix these together before we continue."), items.toString(), MASCOT_JS);
         return html;
     }
 
@@ -154,27 +404,29 @@ public class PlaggController {
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Inter', sans-serif; background: #0a0a0a; color: #fff; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; }
+        %s
         .logo-wrap { position: relative; display: inline-block; }
-        .logo-icon { width: 56px; height: 56px; background: radial-gradient(circle at 30% 30%, #00ff88, #00aa55); border-radius: 16px; display: flex; align-items: center; justify-content: center; font-size: 28px; margin-bottom: 12px; box-shadow: 0 0 30px rgba(0,255,136,0.3); }
-        .logo-dot { width: 10px; height: 10px; background: #00ff88; border-radius: 50%; position: absolute; top: -3px; right: -3px; box-shadow: 0 0 8px #00ff88; }
+        .logo-icon { width: 56px; height: 56px; background: radial-gradient(circle at 30%% 30%%, #00ff88, #00aa55); border-radius: 16px; display: flex; align-items: center; justify-content: center; font-size: 28px; margin-bottom: 12px; box-shadow: 0 0 30px rgba(0,255,136,0.3); }
+        .logo-dot { width: 10px; height: 10px; background: #00ff88; border-radius: 50%%; position: absolute; top: -3px; right: -3px; box-shadow: 0 0 8px #00ff88; }
         h1 { font-family: 'Space Grotesk', sans-serif; font-size: 3.2em; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
         .subtitle { font-size: 0.8em; color: #00ff88; letter-spacing: 0.2em; text-transform: uppercase; font-weight: 500; margin-bottom: 8px; }
         .tagline { color: #555; font-size: 0.9em; margin-bottom: 24px; }
-        .nav-link { color: #00ff88; text-decoration: none; font-size: 0.85em; margin-bottom: 24px; display: inline-block; border: 1px solid rgba(0,255,136,0.25); padding: 8px 18px; border-radius: 20px; }
+        .nav-link { color: #00ff88; text-decoration: none; font-size: 0.85em; margin-bottom: 12px; display: inline-block; border: 1px solid rgba(0,255,136,0.25); padding: 8px 18px; border-radius: 20px; }
         .nav-link:hover { background: rgba(0,255,136,0.08); }
-        .form-card { background: #141414; border: 1px solid #222; border-radius: 20px; padding: 32px; width: 100%; max-width: 440px; }
+        .nav-row { display: flex; gap: 10px; margin-bottom: 24px; }
+        .form-card { background: #141414; border: 1px solid #222; border-radius: 20px; padding: 32px; width: 100%%; max-width: 440px; }
         .field-group { margin-bottom: 16px; }
         .field-label { display: block; font-size: 0.75em; color: #777; letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 8px; font-weight: 500; }
         .field-wrapper { display: flex; align-items: center; background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px; transition: border-color 0.2s; }
         .field-wrapper:focus-within { border-color: #00ff88; box-shadow: 0 0 0 3px rgba(0,255,136,0.08); }
         .field-icon { padding: 0 12px; font-size: 15px; opacity: 0.5; align-self: flex-start; margin-top: 13px; }
-        input, select, textarea { background: transparent; border: none; color: #fff; font-family: 'Inter', sans-serif; font-size: 0.92em; padding: 13px 13px 13px 0; width: 100%; outline: none; resize: vertical; }
+        input, select, textarea { background: transparent; border: none; color: #fff; font-family: 'Inter', sans-serif; font-size: 0.92em; padding: 13px 13px 13px 0; width: 100%%; outline: none; resize: vertical; }
         textarea { min-height: 80px; }
         select { padding: 13px; cursor: pointer; }
         input::placeholder, textarea::placeholder { color: #3a3a3a; }
         select option { background: #1a1a1a; }
         .hint { color: #555; font-size: 0.7em; margin-top: 6px; }
-        .submit-btn { width: 100%; background: #00ff88; color: #000; border: none; border-radius: 10px; padding: 15px; font-size: 0.95em; font-weight: 700; font-family: 'Inter', sans-serif; cursor: pointer; margin-top: 8px; letter-spacing: 0.04em; transition: all 0.2s; }
+        .submit-btn { width: 100%%; background: #00ff88; color: #000; border: none; border-radius: 10px; padding: 15px; font-size: 0.95em; font-weight: 700; font-family: 'Inter', sans-serif; cursor: pointer; margin-top: 8px; letter-spacing: 0.04em; transition: all 0.2s; }
         .submit-btn:hover { background: #00ffaa; transform: translateY(-1px); box-shadow: 0 8px 24px rgba(0,255,136,0.2); }
     </style>
 </head>
@@ -188,7 +440,11 @@ public class PlaggController {
         <p class="subtitle">AI-Powered Recruiting Assistant</p>
     </div>
     <p class="tagline">Enter candidate details for AI evaluation</p>
-    <a href="/leaderboard" class="nav-link">&#128101; View Leaderboard &#8594;</a>
+    %s
+    <div class="nav-row">
+        <a href="/leaderboard" class="nav-link">&#128101; Leaderboard</a>
+        <a href="/qr" class="nav-link">&#128241; Scan QR</a>
+    </div>
     <div class="form-card">
         <form action="/score" method="post">
             <div class="field-group">
@@ -228,18 +484,64 @@ public class PlaggController {
                 </div>
             </div>
             <div class="field-group">
-                <label class="field-label">Resume Text (paste for AI screening)</label>
+                <label class="field-label">Resume Text (optional, for AI screening)</label>
                 <div class="field-wrapper">
                     <span class="field-icon">&#128196;</span>
-                    <textarea name="resume" placeholder="Paste resume text here for AI keyword + quality screening..."></textarea>
+                    <textarea name="resume" placeholder="Paste resume text here for AI screening (optional)..."></textarea>
                 </div>
+                <div class="hint">Optional, but PLAGG's AI will flag it and score lower if skipped.</div>
             </div>
             <button type="submit" class="submit-btn">&#9889; Evaluate Candidate</button>
         </form>
     </div>
+    %s
 </body>
 </html>
-        """;
+        """.formatted(MASCOT_CSS, mascotBlock("Hi, I'm Plagg! Fill this out and I'll evaluate your profile."), MASCOT_JS);
+        return ResponseEntity.ok().header("Content-Type", "text/html; charset=UTF-8").body(html);
+    }
+
+    @GetMapping("/qr")
+    public ResponseEntity<String> qrCode() {
+        String ip = getLocalIp();
+        String targetUrl = "http://" + ip + ":8080/";
+        String qrBase64 = generateQrBase64(targetUrl);
+        String qrImgSrc = "data:image/png;base64," + qrBase64;
+
+        String html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PLAGG - Scan to Enter</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Inter', sans-serif; background: #0a0a0a; color: #fff; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 24px; text-align: center; }
+        %s
+        h1 { font-family: 'Space Grotesk', sans-serif; font-size: 1.8em; margin-bottom: 6px; letter-spacing: 0.04em; }
+        .sub { color: #666; font-size: 0.9em; margin-bottom: 20px; }
+        .qr-card { background: #141414; border: 1px solid #222; border-radius: 20px; padding: 28px; }
+        .qr-card img { border-radius: 10px; background: #fff; padding: 10px; }
+        .url-hint { margin-top: 18px; color: #00ff88; font-size: 0.85em; word-break: break-all; }
+        .board-link { margin-top: 24px; color: #555; font-size: 0.85em; text-decoration: none; border: 1px solid #222; padding: 8px 18px; border-radius: 20px; }
+        .board-link:hover { color: #00ff88; }
+    </style>
+</head>
+<body>
+    <h1>&#9889; Scan to Evaluate</h1>
+    <p class="sub">Point your phone camera at the QR code below</p>
+    %s
+    <div class="qr-card">
+        <img src="%s" width="260" height="260" alt="QR Code"/>
+        <div class="url-hint">%s</div>
+    </div>
+    <a href="/leaderboard" class="board-link">&#128101; View Live Leaderboard &#8594;</a>
+    %s
+</body>
+</html>
+        """.formatted(MASCOT_CSS, mascotBlock("Scan me and bring your friends along!"), qrImgSrc, targetUrl, MASCOT_JS);
         return ResponseEntity.ok().header("Content-Type", "text/html; charset=UTF-8").body(html);
     }
 
@@ -256,6 +558,7 @@ public class PlaggController {
 
         String trimmedName = name == null ? "" : name.trim();
         String trimmedGithub = github == null ? "" : github.trim();
+        String trimmedResume = resume == null ? "" : resume.trim();
 
         if (!trimmedName.matches("[A-Za-z][A-Za-z .]{1,49}")) {
             errors.add("Name must be 2-50 letters (letters, spaces, dots only).");
@@ -277,7 +580,19 @@ public class PlaggController {
         if (errors.isEmpty()) {
             try {
                 RestTemplate rt = new RestTemplate();
-                String ghBody = rt.getForObject("https://api.github.com/users/" + trimmedGithub, String.class);
+                HttpHeaders ghHeaders = new HttpHeaders();
+                String ghToken = System.getenv("GITHUB_TOKEN");
+                if (ghToken != null && !ghToken.isBlank()) {
+                    ghHeaders.setBearerAuth(ghToken);
+                }
+                HttpEntity<Void> ghRequest = new HttpEntity<>(ghHeaders);
+                ResponseEntity<String> ghResponse = rt.exchange(
+                    "https://api.github.com/users/" + trimmedGithub,
+                    HttpMethod.GET,
+                    ghRequest,
+                    String.class
+                );
+                String ghBody = ghResponse.getBody();
                 if (ghBody != null) {
                     Matcher rm = Pattern.compile("\"public_repos\":(\\d+)").matcher(ghBody);
                     if (rm.find()) repos = Integer.parseInt(rm.group(1));
@@ -305,12 +620,28 @@ public class PlaggController {
         boolean hasLinkedin = linkedinUrl != null && !linkedinUrl.isBlank();
         int linkedinScore = hasLinkedin ? 15 : 5;
         int hackathonScore = Math.min(hackathons * 2, 10);
-        int resumeScore = computeResumeScore(resume);
+
+        ResumeAnalysis resumeAnalysis = analyzeResumeWithAI(trimmedResume);
+        int resumeScore = resumeAnalysis.score;
+
         int aiBonus = (githubScore >= 12 && leetcodeScore >= 15) ? 10 : 5;
         int total = githubScore + leetcodeScore + linkedinScore + hackathonScore + resumeScore + aiBonus;
 
         String insight = generateInsight(githubScore, leetcodeScore, linkedinScore, hackathonScore, resumeScore, total);
-        String resumeNote = resumeFeedback(resume, resumeScore);
+
+        StringBuilder resumeFeedbackHtml = new StringBuilder();
+        if (!resumeAnalysis.strengths.isEmpty()) {
+            resumeFeedbackHtml.append("<div class=\"rf-block\"><div class=\"rf-title rf-good\">&#10003; Strengths</div><ul class=\"rf-list\">");
+            for (String s : resumeAnalysis.strengths) {
+                resumeFeedbackHtml.append("<li>").append(s).append("</li>");
+            }
+            resumeFeedbackHtml.append("</ul></div>");
+        }
+        resumeFeedbackHtml.append("<div class=\"rf-block\"><div class=\"rf-title rf-warn\">&#9888; Areas to Improve</div><ul class=\"rf-list\">");
+        for (String s : resumeAnalysis.improvements) {
+            resumeFeedbackHtml.append("<li>").append(s).append("</li>");
+        }
+        resumeFeedbackHtml.append("</ul></div>");
 
         Candidate newCandidate = new Candidate(trimmedName, trimmedGithub, githubScore, leetcodeScore, linkedinScore, hackathonScore, resumeScore, aiBonus, insight);
         LEADERBOARD.add(newCandidate);
@@ -361,6 +692,7 @@ public class PlaggController {
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Inter', sans-serif; background: #0a0a0a; color: #fff; min-height: 100vh; padding: 24px; }
+        %s
         .top-bar { display: flex; align-items: center; justify-content: space-between; max-width: 420px; margin: 0 auto 20px; }
         .back-btn { color: #666; text-decoration: none; font-size: 0.88em; }
         .back-btn:hover { color: #00ff88; }
@@ -405,6 +737,12 @@ public class PlaggController {
         .insight-card { background: linear-gradient(135deg, rgba(0,255,136,0.06), rgba(124,58,237,0.06)); border: 1px solid rgba(0,255,136,0.15); }
         .insight-title { font-size: 0.7em; color: #00ff88; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 10px; font-weight: 600; }
         .insight-text { font-size: 0.9em; color: #ddd; line-height: 1.5; }
+        .rf-block { margin-bottom: 14px; }
+        .rf-block:last-child { margin-bottom: 0; }
+        .rf-title { font-size: 0.75em; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 700; margin-bottom: 8px; }
+        .rf-good { color: #00ff88; }
+        .rf-warn { color: #fbbf24; }
+        .rf-list { margin: 0 0 0 18px; color: #ccc; font-size: 0.85em; line-height: 1.7; }
         .top5-card .breakdown-title { margin-bottom: 8px; }
         .top5-row { display: flex; align-items: center; gap: 10px; padding: 8px 6px; border-radius: 8px; font-size: 0.85em; }
         .top5-rank { font-family: 'Space Grotesk', sans-serif; font-weight: 700; width: 30px; }
@@ -420,6 +758,7 @@ public class PlaggController {
         <span class="page-title">Evaluation Report</span>
         <a href="/leaderboard" class="board-link">&#128101; Full Board</a>
     </div>
+    %s
     <div class="card">
         <div class="candidate-row">
             <div class="avatar">%s</div>
@@ -495,8 +834,8 @@ public class PlaggController {
         </div>
     </div>
     <div class="card">
-        <div class="breakdown-title">&#128196; Resume Screening Note</div>
-        <div class="insight-text">%s</div>
+        <div class="breakdown-title">&#128196; AI Resume Screening Feedback</div>
+        %s
     </div>
     <div class="card insight-card">
         <div class="insight-title">&#10024; AI Insight</div>
@@ -507,10 +846,13 @@ public class PlaggController {
         %s
     </div>
     <a href="/" class="eval-btn">&#8592; Evaluate Another Candidate</a>
+    %s
 </body>
 </html>
         """.formatted(
+            MASCOT_CSS,
             circumference, dashOffset, statusColor,
+            mascotBlock(mascotMessageForScore(total)),
             github.substring(0, 1).toUpperCase(), trimmedName, trimmedGithub,
             total, status, eligibility,
             rank, totalCandidates,
@@ -521,9 +863,10 @@ public class PlaggController {
             resPct, resumeScore,
             aiPct, aiBonus,
             total,
-            resumeNote,
+            resumeFeedbackHtml.toString(),
             insight,
-            top5Html
+            top5Html,
+            MASCOT_JS
         );
         return ResponseEntity.ok().header("Content-Type", "text/html; charset=UTF-8").body(html);
     }
@@ -559,18 +902,21 @@ public class PlaggController {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta http-equiv="refresh" content="5">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PLAGG - Live Leaderboard</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Inter', sans-serif; background: #0a0a0a; color: #fff; min-height: 100vh; padding: 24px; }
+        %s
+        .mascot-row { max-width: 480px; }
         .top-bar { display: flex; align-items: center; justify-content: space-between; max-width: 480px; margin: 0 auto 20px; }
         .back-btn { color: #666; text-decoration: none; font-size: 0.88em; }
         .back-btn:hover { color: #00ff88; }
         .page-title { font-size: 0.72em; letter-spacing: 0.15em; text-transform: uppercase; color: #00ff88; font-weight: 600; }
         h1 { font-family: 'Space Grotesk', sans-serif; font-size: 1.6em; text-align: center; max-width: 480px; margin: 0 auto 4px; }
-        .sub { text-align: center; color: #555; font-size: 0.85em; max-width: 480px; margin: 0 auto 24px; }
+        .sub { text-align: center; color: #555; font-size: 0.85em; max-width: 480px; margin: 0 auto 20px; }
         .lb-list { max-width: 480px; margin: 0 auto; background: #141414; border: 1px solid #1e1e1e; border-radius: 18px; padding: 8px; }
         .lb-row { display: flex; align-items: center; gap: 14px; padding: 14px 12px; border-bottom: 1px solid #1c1c1c; }
         .lb-row:last-child { border-bottom: none; }
@@ -594,13 +940,15 @@ public class PlaggController {
     </div>
     <h1>&#127942; Candidate Rankings</h1>
     <p class="sub">%d candidates evaluated &middot; ranked by AI composite score</p>
+    %s
     <div class="lb-list">
         %s
     </div>
     <a href="/" class="eval-btn">&#9889; Evaluate a New Candidate</a>
+    %s
 </body>
 </html>
-        """.formatted(sorted.size(), rows.toString());
+        """.formatted(MASCOT_CSS, sorted.size(), mascotBlock("Who's leading today? Let's find out!"), rows.toString(), MASCOT_JS);
         return ResponseEntity.ok().header("Content-Type", "text/html; charset=UTF-8").body(html);
     }
 }
